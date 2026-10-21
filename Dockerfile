@@ -1,5 +1,7 @@
 FROM node:22-alpine
-ENV NODE_ENV=production PORT=3000 NODE_OPTIONS=--max-old-space-size=192
+# eMudhra CA distrust (Oct 2026): current CA bundle, and make Node trust it instead of its bundled root list
+RUN apk add --no-cache --upgrade ca-certificates-bundle
+ENV NODE_ENV=production PORT=3000 NODE_OPTIONS="--max-old-space-size=192 --use-openssl-ca"
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
