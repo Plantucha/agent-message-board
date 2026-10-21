@@ -163,6 +163,56 @@ class DeliveryTests(unittest.TestCase):
         bad = self.cli("inbox", "--brief", "--max-chars", "5", name="reader:x")
         self.assertEqual(bad.returncode, 2)
 
+    def test_empty_post_is_refused_but_an_empty_thread_is_not(self):
+        for blank in ("", "   \n\t"):
+            with self.assertRaises(ValueError):
+                self.board.post(str(self.tid), "writer:x", blank)
+        out = self.cli("post", str(self.tid), "-", name="writer:y", stdin="")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("empty", out.stderr)
+        tid, eid = self.board.create_thread("No body yet", ["test"], "owner:test", None)
+        self.assertIsNone(eid)
+        with self.assertRaises(ValueError):
+            self.board.create_thread("Blank body", ["test"], "owner:test", "  ")
+
+    def test_lint_command_gates_posts_and_no_lint_skips_it(self):
+        lint = self.root / "lint.py"
+        lint.write_text("import sys\nbody = sys.stdin.read()\nif 'TODO' in body:\n    print('found TODO')\n    sys.exit(1)\n")
+        os.environ["AGENT_BOARD_LINT_CMD"] = f"{sys.executable} {lint}"
+        try:
+            bad = self.cli("post", str(self.tid), "TODO later", name="writer:y")
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("found TODO", bad.stderr)
+            good = self.cli("post", str(self.tid), "done now", name="writer:y")
+            self.assertEqual(good.returncode, 0, good.stderr)
+            skipped = self.cli("post", str(self.tid), "TODO later", "--no-lint", name="writer:y")
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            os.environ["AGENT_BOARD_LINT_CMD"] = str(self.root / "missing-linter")
+            broken = self.cli("post", str(self.tid), "done now", name="writer:y")
+            self.assertEqual(broken.returncode, 2)
+            self.assertIn("could not run", broken.stderr)
+        finally:
+            os.environ.pop("AGENT_BOARD_LINT_CMD", None)
+        bodies = [e["body"] for e in self.board.thread_entries_after(self.tid, 0)]
+        self.assertEqual(bodies.count("TODO later"), 1)
+
+    def test_no_route_keeps_a_post_on_a_redirecting_thread(self):
+        site, _ = self.board.create_thread("Site and deploy", ["site"], "owner:test", None)
+        self.board.set_topic(str(site), "site", ["deploy"])
+        self.board.set_redirect(str(self.tid), [str(site)])
+        routed = self.board.post(str(self.tid), "writer:x", "deploy report", "note")
+        kept = self.board.post(str(self.tid), "writer:x", "deploy report", "note", route=False)
+        self.assertEqual(self.board.entry(routed)["thread_id"], site)
+        self.assertEqual(self.board.entry(kept)["thread_id"], self.tid)
+        self.assertIsNone(self.board.entry(kept)["routed_from"])
+        out = self.cli("post", str(self.tid), "deploy report", "--no-route", name="writer:y")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"thread #{self.tid} ", out.stdout)
+        self.assertNotIn("redirects by topic", out.stdout)
+        self.board.archive(str(self.tid))
+        with self.assertRaises(ValueError):
+            self.board.post(str(self.tid), "writer:x", "late report", "note", route=False)
+
     def test_auto_archive_skips_pinned_topic_threads(self):
         quiet, _ = self.board.create_thread("Quiet", [], "owner:test", "x")
         topic, _ = self.board.create_thread("Topic", [], "owner:test", "y")
