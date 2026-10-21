@@ -142,6 +142,27 @@ class DeliveryTests(unittest.TestCase):
         self.board.rename(str(gpu), "GPU pods & infrastructure")
         self.assertEqual(self.board.resolve_thread("GPU pods")["id"], gpu)
 
+    def test_inbox_brief_shows_the_first_paragraph_and_a_pointer(self):
+        self.board.subscribe("reader:x", str(self.tid))
+        long_tail = "detail " * 200
+        eid = self.board.post(str(self.tid), "writer:x", f"Unit done: PR 12 is green.\n\n{long_tail}", "finding")
+        short = self.board.post(str(self.tid), "writer:x", "One line only.", "note")
+        out = self.cli("inbox", "--brief", name="reader:x")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Unit done: PR 12 is green.", out.stdout)
+        self.assertNotIn("detail detail", out.stdout)
+        self.assertIn(f"(more: agent-board read {self.tid} --since {eid - 1})", out.stdout)
+        self.assertNotIn(f"--since {short - 1})", out.stdout)
+        self.board.post(str(self.tid), "writer:x", "x" * 500, "note")
+        env_out = subprocess.run(
+            [sys.executable, str(SCRIPT), "--as", "reader:x", "inbox"], capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, AGENT_BOARD_DB=str(self.db), AGENT_BOARD_DIR=str(self.root), AGENT_BOARD_INBOX_BRIEF="1"),
+        )
+        self.assertIn("x" * 299 + "…", env_out.stdout)
+        self.assertNotIn("x" * 300, env_out.stdout)
+        bad = self.cli("inbox", "--brief", "--max-chars", "5", name="reader:x")
+        self.assertEqual(bad.returncode, 2)
+
     def test_empty_post_is_refused_but_an_empty_thread_is_not(self):
         for blank in ("", "   \n\t"):
             with self.assertRaises(ValueError):
