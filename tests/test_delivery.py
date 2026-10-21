@@ -213,6 +213,16 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(board.groups()["humans"], ["human", "owner"])
 
 
+    def test_slot_reports_a_gh_that_cannot_run(self):
+        os.environ["AGENT_BOARD_GH_CMD"] = str(self.root / "no-such-gh")
+        self.addCleanup(os.environ.pop, "AGENT_BOARD_GH_CMD", None)
+        out = self.cli("slot", str(self.tid), "9", name="claude:alpha")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("gh pr ready #9 failed", out.stderr)
+        _, rows = self.board.read_thread(str(self.tid), "owner:test")
+        self.assertEqual(rows[-1]["kind"], "warning")
+        self.assertTrue(rows[-1]["body"].startswith("SLOT #9 FAILED"), rows[-1]["body"])
+
     def test_slot_posts_first_then_runs_gh_and_reports_a_failure(self):
         fake = self.root / "fake-gh"
         log = self.root / "gh.log"
