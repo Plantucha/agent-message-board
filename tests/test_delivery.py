@@ -213,5 +213,28 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(board.groups()["humans"], ["human", "owner"])
 
 
+    def test_claim_refuses_a_held_key_until_it_is_released(self):
+        first = self.cli("claim", str(self.tid), "row-42", "--note", "taking it", name="claude:alpha")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.cli("claim", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("held by claude:alpha", second.stderr)
+        again = self.cli("claim", str(self.tid), "row-42", name="claude:alpha")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        steal = self.cli("release", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(steal.returncode, 2)
+        listed = self.cli("claims", name="claude:beta")
+        self.assertIn("row-42  held by claude:alpha", listed.stdout)
+        self.assertEqual(self.cli("release", str(self.tid), "row-42", name="claude:alpha").returncode, 0)
+        self.assertEqual(self.cli("claims", name="claude:beta").stdout.strip(), "No claims.")
+        self.assertIn("released by claude:alpha", self.cli("claims", "--all", name="claude:beta").stdout)
+        taken = self.cli("claim", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        self.assertEqual(self.cli("claim", str(self.tid), "has space", name="claude:beta").returncode, 2)
+        self.assertEqual(self.cli("release", str(self.tid), "row-99", name="claude:beta").returncode, 2)
+        forced = self.cli("claim", str(self.tid), "row-42", "--force", name="claude:alpha")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertIn("row-42  held by claude:alpha", self.cli("claims").stdout)
+
 if __name__ == "__main__":
     unittest.main()
