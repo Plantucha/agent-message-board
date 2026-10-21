@@ -142,6 +142,77 @@ class DeliveryTests(unittest.TestCase):
         self.board.rename(str(gpu), "GPU pods & infrastructure")
         self.assertEqual(self.board.resolve_thread("GPU pods")["id"], gpu)
 
+    def test_inbox_brief_shows_the_first_paragraph_and_a_pointer(self):
+        self.board.subscribe("reader:x", str(self.tid))
+        long_tail = "detail " * 200
+        eid = self.board.post(str(self.tid), "writer:x", f"Unit done: PR 12 is green.\n\n{long_tail}", "finding")
+        short = self.board.post(str(self.tid), "writer:x", "One line only.", "note")
+        out = self.cli("inbox", "--brief", name="reader:x")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Unit done: PR 12 is green.", out.stdout)
+        self.assertNotIn("detail detail", out.stdout)
+        self.assertIn(f"(more: agent-board read {self.tid} --since {eid - 1})", out.stdout)
+        self.assertNotIn(f"--since {short - 1})", out.stdout)
+        self.board.post(str(self.tid), "writer:x", "x" * 500, "note")
+        env_out = subprocess.run(
+            [sys.executable, str(SCRIPT), "--as", "reader:x", "inbox"], capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, AGENT_BOARD_DB=str(self.db), AGENT_BOARD_DIR=str(self.root), AGENT_BOARD_INBOX_BRIEF="1"),
+        )
+        self.assertIn("x" * 299 + "…", env_out.stdout)
+        self.assertNotIn("x" * 300, env_out.stdout)
+        bad = self.cli("inbox", "--brief", "--max-chars", "5", name="reader:x")
+        self.assertEqual(bad.returncode, 2)
+
+    def test_empty_post_is_refused_but_an_empty_thread_is_not(self):
+        for blank in ("", "   \n\t"):
+            with self.assertRaises(ValueError):
+                self.board.post(str(self.tid), "writer:x", blank)
+        out = self.cli("post", str(self.tid), "-", name="writer:y", stdin="")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("empty", out.stderr)
+        tid, eid = self.board.create_thread("No body yet", ["test"], "owner:test", None)
+        self.assertIsNone(eid)
+        with self.assertRaises(ValueError):
+            self.board.create_thread("Blank body", ["test"], "owner:test", "  ")
+
+    def test_lint_command_gates_posts_and_no_lint_skips_it(self):
+        lint = self.root / "lint.py"
+        lint.write_text("import sys\nbody = sys.stdin.read()\nif 'TODO' in body:\n    print('found TODO')\n    sys.exit(1)\n")
+        os.environ["AGENT_BOARD_LINT_CMD"] = f"{sys.executable} {lint}"
+        try:
+            bad = self.cli("post", str(self.tid), "TODO later", name="writer:y")
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("found TODO", bad.stderr)
+            good = self.cli("post", str(self.tid), "done now", name="writer:y")
+            self.assertEqual(good.returncode, 0, good.stderr)
+            skipped = self.cli("post", str(self.tid), "TODO later", "--no-lint", name="writer:y")
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            os.environ["AGENT_BOARD_LINT_CMD"] = str(self.root / "missing-linter")
+            broken = self.cli("post", str(self.tid), "done now", name="writer:y")
+            self.assertEqual(broken.returncode, 2)
+            self.assertIn("could not run", broken.stderr)
+        finally:
+            os.environ.pop("AGENT_BOARD_LINT_CMD", None)
+        bodies = [e["body"] for e in self.board.thread_entries_after(self.tid, 0)]
+        self.assertEqual(bodies.count("TODO later"), 1)
+
+    def test_no_route_keeps_a_post_on_a_redirecting_thread(self):
+        site, _ = self.board.create_thread("Site and deploy", ["site"], "owner:test", None)
+        self.board.set_topic(str(site), "site", ["deploy"])
+        self.board.set_redirect(str(self.tid), [str(site)])
+        routed = self.board.post(str(self.tid), "writer:x", "deploy report", "note")
+        kept = self.board.post(str(self.tid), "writer:x", "deploy report", "note", route=False)
+        self.assertEqual(self.board.entry(routed)["thread_id"], site)
+        self.assertEqual(self.board.entry(kept)["thread_id"], self.tid)
+        self.assertIsNone(self.board.entry(kept)["routed_from"])
+        out = self.cli("post", str(self.tid), "deploy report", "--no-route", name="writer:y")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"thread #{self.tid} ", out.stdout)
+        self.assertNotIn("redirects by topic", out.stdout)
+        self.board.archive(str(self.tid))
+        with self.assertRaises(ValueError):
+            self.board.post(str(self.tid), "writer:x", "late report", "note", route=False)
+
     def test_auto_archive_skips_pinned_topic_threads(self):
         quiet, _ = self.board.create_thread("Quiet", [], "owner:test", "x")
         topic, _ = self.board.create_thread("Topic", [], "owner:test", "y")
@@ -234,6 +305,29 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(tail[2][1].startswith("SLOT #7 FAILED (exit 1)"))
         self.assertEqual(self.cli("slot", str(self.tid), "abc", name="claude:alpha").returncode, 2)
         self.assertEqual(self.cli("slot", str(self.tid), "5", "--repo", "bad repo", name="claude:alpha").returncode, 2)
+
+    def test_claim_refuses_a_held_key_until_it_is_released(self):
+        first = self.cli("claim", str(self.tid), "row-42", "--note", "taking it", name="claude:alpha")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.cli("claim", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("held by claude:alpha", second.stderr)
+        again = self.cli("claim", str(self.tid), "row-42", name="claude:alpha")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        steal = self.cli("release", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(steal.returncode, 2)
+        listed = self.cli("claims", name="claude:beta")
+        self.assertIn("row-42  held by claude:alpha", listed.stdout)
+        self.assertEqual(self.cli("release", str(self.tid), "row-42", name="claude:alpha").returncode, 0)
+        self.assertEqual(self.cli("claims", name="claude:beta").stdout.strip(), "No claims.")
+        self.assertIn("released by claude:alpha", self.cli("claims", "--all", name="claude:beta").stdout)
+        taken = self.cli("claim", str(self.tid), "row-42", name="claude:beta")
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        self.assertEqual(self.cli("claim", str(self.tid), "has space", name="claude:beta").returncode, 2)
+        self.assertEqual(self.cli("release", str(self.tid), "row-99", name="claude:beta").returncode, 2)
+        forced = self.cli("claim", str(self.tid), "row-42", "--force", name="claude:alpha")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertIn("row-42  held by claude:alpha", self.cli("claims").stdout)
 
 if __name__ == "__main__":
     unittest.main()
