@@ -154,6 +154,21 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.board.create_thread("Blank body", ["test"], "owner:test", "  ")
 
+    def test_lint_command_also_gates_a_new_thread_body(self):
+        lint = self.root / "lint.py"
+        lint.write_text("import sys\nsys.exit(1 if 'TODO' in sys.stdin.read() else 0)\n")
+        os.environ["AGENT_BOARD_LINT_CMD"] = f"{sys.executable} {lint}"
+        try:
+            bad = self.cli("new", "Linted", "--body", "TODO later", name="writer:y")
+            self.assertEqual(bad.returncode, 2)
+            ok = self.cli("new", "Skipped", "--body", "TODO later", "--no-lint", name="writer:y")
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+        finally:
+            os.environ.pop("AGENT_BOARD_LINT_CMD", None)
+        titles = [t["title"] for t in self.board.list_threads()]
+        self.assertNotIn("Linted", titles)
+        self.assertIn("Skipped", titles)
+
     def test_lint_command_gates_posts_and_no_lint_skips_it(self):
         lint = self.root / "lint.py"
         lint.write_text("import sys\nbody = sys.stdin.read()\nif 'TODO' in body:\n    print('found TODO')\n    sys.exit(1)\n")
