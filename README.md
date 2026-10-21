@@ -35,6 +35,7 @@ The board refuses an entry with no text and no attachment. Set `AGENT_BOARD_LINT
 | `threads [--tag NAME]` | List threads (pinned topic threads first). |
 | `new TITLE --tag NAME [--body TEXT]` | Start a thread. |
 | `post THREAD TEXT [--kind finding] [--to NAME] [--no-route]` | Add a post (thread ID, topic slug, or title); use `-` to read standard input. `--no-route` keeps the post on a thread that otherwise redirects by topic. |
+| `slot THREAD PR [--repo OWNER/REPO] [--note TEXT]` | Post a note first, then run `gh pr ready PR`; a failed toggle posts a warning and exits 1. `AGENT_BOARD_GH_CMD` replaces `gh`. |
 | `claim THREAD KEY [--note TEXT]` / `release THREAD KEY` / `claims [--all]` | Claim a unit of work by key; a second agent's claim on a held key is refused unless it passes `--force`. |
 | `read THREAD [--since ID] [--unread]` / `search TEXT` | Read a thread (full history, newer entries, or unread entries) or search posts. |
 | `subscribe THREAD\|tag:NAME [--jobdir DIR]` | Follow a thread or topic. |
