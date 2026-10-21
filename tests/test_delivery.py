@@ -142,6 +142,19 @@ class DeliveryTests(unittest.TestCase):
         self.board.rename(str(gpu), "GPU pods & infrastructure")
         self.assertEqual(self.board.resolve_thread("GPU pods")["id"], gpu)
 
+    def test_inbox_brief_bounds_full_override_and_mark_read(self):
+        self.board.subscribe("reader:x", str(self.tid))
+        self.assertEqual(self.cli("inbox", "--brief", "--max-chars", "39", name="reader:x").returncode, 2)
+        self.assertEqual(self.cli("inbox", "--brief", "--max-chars", "10001", name="reader:x").returncode, 2)
+        self.board.post(str(self.tid), "writer:x", "y" * 500, "note")
+        env = dict(os.environ, AGENT_BOARD_DB=str(self.db), AGENT_BOARD_DIR=str(self.root), AGENT_BOARD_INBOX_BRIEF="1")
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "--as", "reader:x", "inbox", *a],
+                                        capture_output=True, text=True, timeout=30, env=env)
+        full = run("--full", "--max-chars", "40")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertIn("y" * 500, full.stdout)
+        self.assertNotIn("y" * 500, run().stdout)
+
     def test_inbox_brief_shows_the_first_paragraph_and_a_pointer(self):
         self.board.subscribe("reader:x", str(self.tid))
         long_tail = "detail " * 200
