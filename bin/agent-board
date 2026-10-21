@@ -254,6 +254,34 @@ def validate_content(title: str | None, body: str, attachments: Iterable[str] = 
         assert_no_secrets(path)
 
 
+def assert_not_empty(body: str, files: Iterable[str] = ()) -> None:
+    # An entry with no text and no attachment reaches every subscriber's inbox and says nothing.
+    # It is almost always a broken pipe (`post T - < missing-file`) or an unset shell variable,
+    # so the board refuses it rather than delivering a blank item to every reader.
+    if not body.strip() and not list(files):
+        raise ValueError("Post refused: the entry is empty. Give it text or an attachment.")
+
+
+def lint_body(body: str) -> None:
+    """Run the optional AGENT_BOARD_LINT_CMD over a post body before it is stored.
+
+    The command receives the body on standard input. A non-zero exit refuses the post and shows the
+    linter's own output, so a team can hold every post to a house style (length, one idea per
+    sentence, banned words) without the board knowing the rules. Unset means no lint.
+    """
+    command = os.environ.get("AGENT_BOARD_LINT_CMD", "").strip()
+    if not command:
+        return
+    try:
+        result = subprocess.run(shlex.split(command), input=body, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # A linter that cannot run is a broken setup, not a style finding: refuse and say which.
+        raise ValueError(f"Post refused: the lint command could not run ({exc}).") from exc
+    if result.returncode != 0:
+        detail = (result.stdout + result.stderr).strip()[:2000]
+        raise ValueError(f"Post refused by the lint command (exit {result.returncode}). Fix the text, or pass --no-lint.\n{detail}")
+
+
 def read_body(value: str) -> str:
     if value != "-":
         return value
@@ -574,6 +602,9 @@ class Board:
                       to: Iterable[str] = ()) -> tuple[int, int | None]:
         files = files or []
         validate_content(title, body or "", files)
+        if body is not None:
+            # `new` without --body creates an empty thread on purpose; an explicit empty body does not.
+            assert_not_empty(body, files)
         if len(files) > MAX_ATTACHMENTS:
             raise ValueError(f"At most {MAX_ATTACHMENTS} attachment references are allowed per entry.")
         if kind not in KINDS:
@@ -613,18 +644,23 @@ class Board:
         return best
 
     def post(self, ref: str, author: str, body: str, kind: str = "note", files: list[str] | None = None,
-             to: Iterable[str] = ()) -> int:
+             to: Iterable[str] = (), route: bool = True) -> int:
         files = files or []
         if kind not in KINDS:
             raise ValueError(f"Unknown entry kind {kind!r}.")
         validate_content(None, body, files)
+        assert_not_empty(body, files)
         if len(files) > MAX_ATTACHMENTS:
             raise ValueError(f"At most {MAX_ATTACHMENTS} attachment references are allowed per entry.")
         author = validate_agent(author)
         with self.transaction() as conn:
             thread = self._thread(conn, ref)
             routed_from = None
-            if thread["redirect"]:
+            # route=False keeps the post on the named thread even when that thread redirects by topic.
+            # Keyword routing guesses from the text; a post the author knows belongs to one thread
+            # (a daily report, a standing digest) should not move because its body happens to
+            # mention another topic's keywords more often.
+            if thread["redirect"] and route:
                 routed_from = int(thread["id"])
                 thread = self._route(conn, thread, body)
             if thread["archived_at"]:
@@ -1446,18 +1482,39 @@ def format_push(items: list[dict], agent: str, max_chars: int = HOOK_MAX_CHARS) 
     return "\n".join(lines)
 
 
-def display_entry(row: sqlite3.Row | dict) -> None:
+def brief_body(body: str, max_chars: int) -> tuple[str, bool]:
+    """Return the entry's first paragraph, cut to max_chars, and whether anything was left out.
+
+    Long unit reports are the norm on a busy board, and an agent that reads its inbox every few
+    minutes pays for every byte of every post on every read. Authors put the claim or the result
+    first, so the first paragraph is the part a reader needs to decide whether to open the rest.
+    """
+    text = body.strip()
+    first = re.split(r"\n\s*\n", text, maxsplit=1)[0]
+    short = one_line(first, max_chars)
+    return short, short != " ".join(text.split())
+
+
+def display_entry(row: sqlite3.Row | dict, brief: int = 0) -> None:
     extra = ""
     if isinstance(row, dict) and row.get("addresses"):
         extra = " → " + " ".join("@" + a for a in row["addresses"])
     print(f"#{row['id']} [{row['created_at']}] {terminal_text(row['author'])} · {row['kind']}{terminal_text(extra)}")
+    if brief:
+        short, cut = brief_body(row["body"], brief)
+        print(terminal_text(short))
+        if cut:
+            # The pointer reads exactly this entry and the ones after it, and marks them read.
+            print(f"(more: agent-board read {row['thread_id']} --since {int(row['id']) - 1})")
+        print()
+        return
     print(terminal_text(row["body"]))
     for path in (row.get("attachments", []) if isinstance(row, dict) else []):
         print(f"Attachment reference: {terminal_text(path)}")
     print()
 
 
-def print_entry_set(rows: list[dict]) -> None:
+def print_entry_set(rows: list[dict], brief: int = 0) -> None:
     print(SAFETY_HEADER)
     print()
     if not rows:
@@ -1471,7 +1528,7 @@ def print_entry_set(rows: list[dict]) -> None:
                 print()
                 heading = current
         print(f"Thread #{row['thread_id']}: {terminal_text(row['title'])}")
-        display_entry(row)
+        display_entry(row, brief)
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -1494,13 +1551,17 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", action="append", default=[], help="Address the entry to an agent, job, or @group (repeatable).")
     p.add_argument("--file", action="append", default=[], help="Attach a local file path reference (the file is not copied).")
     p.add_argument("--telegram", action="store_true", help="Enable a throttled digest line to the human for this thread.")
+    p.add_argument("--no-lint", action="store_true", help="Skip AGENT_BOARD_LINT_CMD for this entry.")
 
     p = sub.add_parser("post", help="Post a markdown entry to a thread (ID, topic slug, or title).")
     p.add_argument("thread")
     p.add_argument("text", help="Markdown text, or - to read it from stdin.")
     p.add_argument("--kind", choices=sorted(KINDS), default="note")
+    p.add_argument("--no-lint", action="store_true", help="Skip AGENT_BOARD_LINT_CMD for this entry.")
     p.add_argument("--to", action="append", default=[], help="Address the entry to an agent, job, or @group (repeatable).")
     p.add_argument("--file", action="append", default=[], help="Attach a local file path reference (the file is not copied).")
+    p.add_argument("--no-route", action="store_true",
+                   help="Post to the named thread itself even if it redirects new posts by topic.")
 
     p = sub.add_parser("claim", help="Claim a unit of work by key; refused when another agent holds the key.")
     p.add_argument("thread")
@@ -1537,6 +1598,11 @@ def make_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("inbox", help="Show unread entries (addressed first, then subscriptions); marks them read.")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--brief", action="store_true",
+                   help="Show each entry's first paragraph only, with a pointer to the full text "
+                        "(default when AGENT_BOARD_INBOX_BRIEF=1).")
+    p.add_argument("--full", action="store_true", help="Show full entries even when AGENT_BOARD_INBOX_BRIEF=1.")
+    p.add_argument("--max-chars", type=int, default=300, help="Length cap for --brief (default 300).")
 
     p = sub.add_parser("wait", help="Block until a thread or inbox has a new unread entry.")
     p.add_argument("target", nargs="?", help="Thread ID/title; omit with --inbox.")
@@ -1786,13 +1852,17 @@ def main(argv: list[str] | None = None) -> int:
                       f"{thread['entry_count']} entries · {stamp}{latest_text}{flags}")
         elif cmd == "new":
             body = read_body(args.body) if args.body is not None else None
+            if body is not None and not args.no_lint:
+                lint_body(body)
             files = [resolve_attachment(p) for p in args.file]
             tid, eid = board.create_thread(args.title, args.tag, agent, body, args.kind, files, args.telegram, args.to)
             print(f"Created thread #{tid}" + (f" with entry #{eid}." if eid is not None else "."))
         elif cmd == "post":
             body = read_body(args.text)
+            if not args.no_lint:
+                lint_body(body)
             files = [resolve_attachment(p) for p in args.file]
-            eid = board.post(args.thread, agent, body, args.kind, files, args.to)
+            eid = board.post(args.thread, agent, body, args.kind, files, args.to, route=not args.no_route)
             entry = board.entry(eid)
             note = f" (thread #{entry['routed_from']} redirects by topic)" if entry["routed_from"] else ""
             print(f"Posted entry #{eid} to thread #{entry['thread_id']} {terminal_text(entry['title'])}{note}.")
@@ -1840,7 +1910,10 @@ def main(argv: list[str] | None = None) -> int:
         elif cmd == "inbox":
             if args.limit < 1 or args.limit > 1000:
                 raise ValueError("Inbox limit must be between 1 and 1000.")
-            print_entry_set(board.inbox(agent, args.limit, mark_read=True, jobdir=jobdir))
+            if args.max_chars < 40 or args.max_chars > 10_000:
+                raise ValueError("--max-chars must be between 40 and 10000.")
+            brief = args.brief or (os.environ.get("AGENT_BOARD_INBOX_BRIEF") == "1" and not args.full)
+            print_entry_set(board.inbox(agent, args.limit, mark_read=True, jobdir=jobdir), args.max_chars if brief else 0)
         elif cmd == "wait":
             if args.inbox == bool(args.target):
                 raise ValueError("Use either a thread target or --inbox.")
