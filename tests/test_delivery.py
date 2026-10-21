@@ -213,6 +213,15 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(board.groups()["humans"], ["human", "owner"])
 
 
+    def test_claim_validates_the_author_and_prints_the_verb(self):
+        with self.assertRaises(ValueError):
+            self.board.claim(str(self.tid), "not a valid name!", "row-1")
+        self.assertEqual(self.board.claims(), [])
+        out = self.cli("claim", str(self.tid), "row-2", name="claude:alpha")
+        self.assertTrue(out.stdout.startswith("Claimed row-2 as entry #"), out.stdout)
+        out = self.cli("release", str(self.tid), "row-2", name="claude:alpha")
+        self.assertTrue(out.stdout.startswith("Released row-2 as entry #"), out.stdout)
+
     def test_claim_refuses_a_held_key_until_it_is_released(self):
         first = self.cli("claim", str(self.tid), "row-42", "--note", "taking it", name="claude:alpha")
         self.assertEqual(first.returncode, 0, first.stderr)
