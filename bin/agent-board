@@ -199,10 +199,45 @@ def age_seconds(value: str) -> float:
 
 
 def validate_agent(agent: str) -> str:
+    """Return the canonical agent name. Names are case-insensitive: `Heron` and `heron` are one agent."""
     agent = agent.strip()
     if not AGENT_RE.fullmatch(agent):
         raise ValueError("Agent names may contain only letters, digits, dot, underscore, hyphen, or colon (max 96 chars).")
-    return agent
+    return agent.lower()
+
+
+# Tables that store an agent name, with the column. A one-time migration folds old mixed-case names.
+AGENT_COLUMNS = (
+    ("entries", "author"),
+    ("read_receipts", "agent"),
+    ("acks", "agent"),
+    ("agents", "agent"),
+    ("deliveries", "agent"),
+    ("subscriptions", "agent"),
+)
+
+
+def hoist_as(argv: list[str]) -> list[str]:
+    """Move `--as NAME` / `--as=NAME` given after the subcommand to the front, where argparse reads it.
+    Tokens after a bare `--` are data and stay where they are."""
+    out: list[str] = []
+    front: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            out.extend(argv[i:])
+            break
+        if tok == "--as" and i + 1 < len(argv):
+            front.extend(argv[i:i + 2])
+            i += 2
+            continue
+        if tok.startswith("--as="):
+            front.append(tok)
+        else:
+            out.append(tok)
+        i += 1
+    return front + out
 
 
 def validate_tag(tag: str) -> str:
@@ -486,10 +521,27 @@ class Board:
                 except Exception:
                     conn.execute("ROLLBACK")
                     raise
+            if not conn.execute("SELECT 1 FROM events WHERE kind='agent-case-v1'").fetchone():
+                self._fold_agent_case(conn)
         finally:
             conn.close()
         with contextlib.suppress(OSError):
             self.path.chmod(0o600)
+
+    def _fold_agent_case(self, conn: sqlite3.Connection) -> None:
+        """Fold every stored agent name to lower case, once. Where a folded key collides with an existing
+        row (a read receipt both `Heron` and `heron` hold), the lower-case row is kept."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not conn.execute("SELECT 1 FROM events WHERE kind='agent-case-v1'").fetchone():
+                for table, column in AGENT_COLUMNS:
+                    conn.execute(f"UPDATE OR IGNORE {table} SET {column}=lower({column}) WHERE {column}<>lower({column})")
+                    conn.execute(f"DELETE FROM {table} WHERE {column}<>lower({column})")
+                conn.execute("INSERT INTO events(kind,detail,created_at) VALUES('agent-case-v1','',?)", (now_text(),))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _backfill_addresses(self, conn: sqlite3.Connection) -> None:
         """Older entries only used @mentions; index them (and 'job-name:' prefixes) without requiring acks."""
@@ -1823,7 +1875,7 @@ def web_server(board: Board, port: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
-    args = make_parser().parse_args(argv)
+    args = make_parser().parse_args(hoist_as(list(sys.argv[1:] if argv is None else argv)))
     db_path = Path(os.environ.get("AGENT_BOARD_DB", str(DB_PATH))).expanduser()
     cmd = args.command
     if cmd == "hook":

@@ -140,6 +140,58 @@ class BoardTests(unittest.TestCase):
             proc.terminate()
             proc.communicate(timeout=5)
 
+    def test_agent_names_are_case_insensitive(self):
+        thread_id, _ = self.board.create_thread("Case", ["test"], "owner:test", None)
+        self.board.subscribe("Reader", str(thread_id), from_start=True)
+        self.board.post(str(thread_id), "Writer", "first", "note")
+        self.board.post(str(thread_id), "writer", "second", "note")
+        conn = self.board.connect()
+        try:
+            authors = {row[0] for row in conn.execute("SELECT author FROM entries")}
+        finally:
+            conn.close()
+        self.assertEqual(authors, {"writer"})
+        self.assertEqual([item["body"] for item in self.board.inbox("reader")], ["first", "second"])
+        self.assertEqual(self.board.inbox("READER"), [])
+
+    def test_existing_mixed_case_names_fold_once_and_keep_one_receipt(self):
+        thread_id, _ = self.board.create_thread("Legacy", ["test"], "owner:test", None)
+        entry_id = self.board.post(str(thread_id), "writer", "old", "note")
+        conn = self.board.connect()
+        try:
+            conn.execute("UPDATE entries SET author='Heron'")
+            conn.execute("INSERT INTO read_receipts(agent,entry_id,read_at) VALUES('Heron',?,'t'),('heron',?,'t')",
+                         (entry_id, entry_id))
+            conn.execute("DELETE FROM events WHERE kind='agent-case-v1'")
+        finally:
+            conn.close()
+        board_module.Board(self.db)
+        conn = self.board.connect()
+        try:
+            self.assertEqual([r[0] for r in conn.execute("SELECT author FROM entries")], ["heron"])
+            self.assertEqual([r[0] for r in conn.execute("SELECT agent FROM read_receipts")], ["heron"])
+        finally:
+            conn.close()
+
+    def test_as_is_accepted_after_the_subcommand(self):
+        self.assertEqual(board_module.hoist_as(["post", "8", "--as", "kestrel", "-"]),
+                         ["--as", "kestrel", "post", "8", "-"])
+        self.assertEqual(board_module.hoist_as(["post", "8", "--as=kestrel", "body"]),
+                         ["--as=kestrel", "post", "8", "body"])
+        self.assertEqual(board_module.hoist_as(["post", "8", "--", "--as", "x"]),
+                         ["post", "8", "--", "--as", "x"])
+        thread_id, _ = self.board.create_thread("Hoist", ["test"], "owner:test", None)
+        os.environ["AGENT_BOARD_DB"] = str(self.db)
+        try:
+            self.assertEqual(board_module.main(["post", str(thread_id), "--as", "Kestrel", "hello"]), 0)
+        finally:
+            del os.environ["AGENT_BOARD_DB"]
+        conn = self.board.connect()
+        try:
+            self.assertEqual([r[0] for r in conn.execute("SELECT author FROM entries")], ["kestrel"])
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
